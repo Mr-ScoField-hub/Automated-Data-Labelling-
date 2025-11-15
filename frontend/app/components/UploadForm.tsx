@@ -23,7 +23,7 @@ export default function UploadForm() {
         const formData = new FormData();
         formData.append("file", file);
 
-        const uploadRes = await fetch("http://localhost:8000/upload/", { method: "POST", body: formData });
+        const uploadRes = await fetch("https://backend-personalpage.fly.dev/upload/", { method: "POST", body: formData });
         const uploadData = await uploadRes.json();
         if (uploadData.status !== "success") {
             setLoading(false);
@@ -34,7 +34,7 @@ export default function UploadForm() {
         embedForm.append("filename", file.name);
         embedForm.append("caption", caption);
 
-        const embedRes = await fetch("http://localhost:8000/embed/", { method: "POST", body: embedForm });
+        const embedRes = await fetch("https://backend-personalpage.fly.dev/embed/", { method: "POST", body: embedForm });
         const embedData = await embedRes.json();
 
         const flat = embedData.matrix[0];
