@@ -1,92 +1,84 @@
-from fastapi import FastAPI, UploadFile, File, Form
+from fastapi import FastAPI, UploadFile, Form, Query
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+import os, shutil, json, torch
 from PIL import Image
-import os
-import torch
-import numpy as np
-from torchvision import models, transforms
-from sklearn.neighbors import KNeighborsClassifier
+from clip import clip
 
 app = FastAPI()
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"]
+)
+
+DATA_DIR = "data"
 UPLOAD_DIR = "uploads"
+EMBED_DIR = "embeddings"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
+os.makedirs(EMBED_DIR, exist_ok=True)
+os.makedirs(DATA_DIR, exist_ok=True)
 
+captions_file = os.path.join(DATA_DIR, "captions.json")
+if not os.path.exists(captions_file):
+    with open(captions_file, "w") as f:
+        json.dump({}, f)
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
-from torchvision.models import resnet50, ResNet50_Weights
-weights = ResNet50_Weights.DEFAULT
-resnet = resnet50(weights=weights).to(device)
-resnet.eval()
+model, preprocess = clip.load("ViT-B/32", device=device)
 
-feature_transform = transforms.Compose([
-    transforms.Resize((224, 224)),
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485,0.456,0.406], std=[0.229,0.224,0.225])
-])
-
-# Few-shot classifier storage
-knn = None
-labeled_features = []
-labeled_classes = []
-
-class Prediction(BaseModel):
-    filename: str
-    predicted_class: str
-
-def extract_features(img: Image.Image):
-    x = feature_transform(img).unsqueeze(0).to(device)
-    with torch.no_grad():
-        feat = resnet(x)
-    return feat.cpu().numpy().flatten()
+def get_next_embedding_name():
+    existing = [f for f in os.listdir(EMBED_DIR) if f.startswith("embedding_") and f.endswith(".pt")]
+    if not existing:
+        return "embedding_001.pt"
+    existing_numbers = [int(f.split("_")[1].split(".")[0]) for f in existing]
+    next_number = max(existing_numbers) + 1
+    return f"embedding_{next_number:03d}.pt"
 
 @app.post("/upload/")
-async def upload_images(files: list[UploadFile] = File(...)):
-    saved_files = []
-    for file in files:
-        path = os.path.join(UPLOAD_DIR, file.filename)
-        with open(path, "wb") as f:
-            f.write(await file.read())
-        saved_files.append(file.filename)
-    return {"status": "success", "files": saved_files}
+async def upload_image(file: UploadFile):
+    file_location = os.path.join(UPLOAD_DIR, file.filename)
+    with open(file_location, "wb") as f:
+        shutil.copyfileobj(file.file, f)
+    return {"status": "success", "filename": file.filename}
 
-@app.post("/label/")
-async def label_image(
-    filename: str = Form(...),
-    user_class: str = Form(...),
-    x1: int = Form(...),
-    y1: int = Form(...),
-    x2: int = Form(...),
-    y2: int = Form(...)
-):
-    global labeled_features, labeled_classes, knn
-    path = os.path.join(UPLOAD_DIR, filename)
-    img = Image.open(path).convert("RGB")
-    cropped = img.crop((x1, y1, x2, y2))
-    feat = extract_features(cropped)
-    labeled_features.append(feat)
-    labeled_classes.append(user_class)
-    # Train KNN if more than one class
-    if len(set(labeled_classes)) > 1:
-        knn = KNeighborsClassifier(n_neighbors=3)
-        knn.fit(np.array(labeled_features), labeled_classes)
-    return {"status": "success", "class": user_class}
+@app.post("/embed/")
+async def generate_embedding(filename: str = Form(...), caption: str = Form(...)):
+    # Save caption
+    with open(captions_file, "r") as f:
+        captions = json.load(f)
+    captions[filename] = caption
+    with open(captions_file, "w") as f:
+        json.dump(captions, f, indent=2)
 
-@app.get("/predict/")
-async def predict():
-    predictions = []
-    if knn is None:
-        return {"status": "waiting for labeled examples"}
-    for file in os.listdir(UPLOAD_DIR):
-        path = os.path.join(UPLOAD_DIR, file)
-        img = Image.open(path).convert("RGB")
-        feat = extract_features(img)
-        pred_class = knn.predict([feat])[0]
-        predictions.append(Prediction(filename=file, predicted_class=pred_class))
-    return {"predictions": predictions}
+    # Load image and text
+    image = preprocess(Image.open(os.path.join(UPLOAD_DIR, filename))).unsqueeze(0).to(device)
+    text_tokens = clip.tokenize([caption]).to(device)
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    with torch.no_grad():
+        img_embed = model.encode_image(image)
+        txt_embed = model.encode_text(text_tokens)
+
+    # Normalize embeddings
+    img_embed = img_embed / img_embed.norm(dim=-1, keepdim=True)
+    txt_embed = txt_embed / txt_embed.norm(dim=-1, keepdim=True)
+
+    # Combine and save
+    combined = torch.cat([img_embed, txt_embed], dim=-1)
+    emb_filename = get_next_embedding_name()
+    emb_path = os.path.join(EMBED_DIR, emb_filename)
+    torch.save(combined.cpu(), emb_path)
+
+    # Return matrix for frontend
+    matrix = combined.cpu().numpy().tolist()
+    return {"filename": filename, "embedding_file": emb_filename, "matrix": matrix}
+
+@app.get("/embed_matrix/")
+async def get_embedding_matrix(file: str = Query(...)):
+    emb_path = os.path.join(EMBED_DIR, file)
+    if not os.path.exists(emb_path):
+        return {"error": "Embedding file not found"}
+    tensor = torch.load(emb_path)
+    matrix = tensor.cpu().numpy().tolist()
+    return {"filename": file, "matrix": matrix}
