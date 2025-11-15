@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, Form, Query
+from fastapi import FastAPI, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
 import os, shutil, json, torch
 from PIL import Image
@@ -52,33 +52,25 @@ async def generate_embedding(filename: str = Form(...), caption: str = Form(...)
     with open(captions_file, "w") as f:
         json.dump(captions, f, indent=2)
 
-    # Load image and text
+    # Load image
     image = preprocess(Image.open(os.path.join(UPLOAD_DIR, filename))).unsqueeze(0).to(device)
-    text_tokens = clip.tokenize([caption]).to(device)
+    text = clip.tokenize([caption]).to(device)
 
     with torch.no_grad():
-        img_embed = model.encode_image(image)
-        txt_embed = model.encode_text(text_tokens)
+        image_embedding = model.encode_image(image)
+        text_embedding = model.encode_text(text)
 
-    # Normalize embeddings
-    img_embed = img_embed / img_embed.norm(dim=-1, keepdim=True)
-    txt_embed = txt_embed / txt_embed.norm(dim=-1, keepdim=True)
+    # Normalize
+    image_embedding = image_embedding / image_embedding.norm(dim=-1, keepdim=True)
+    text_embedding = text_embedding / text_embedding.norm(dim=-1, keepdim=True)
 
-    # Combine and save
-    combined = torch.cat([img_embed, txt_embed], dim=-1)
+    # Combine embeddings
+    combined = torch.cat([image_embedding, text_embedding], dim=-1)
     emb_filename = get_next_embedding_name()
     emb_path = os.path.join(EMBED_DIR, emb_filename)
     torch.save(combined.cpu(), emb_path)
 
-    # Return matrix for frontend
+    # Convert tensor to 2D array for frontend display
     matrix = combined.cpu().numpy().tolist()
-    return {"filename": filename, "embedding_file": emb_filename, "matrix": matrix}
 
-@app.get("/embed_matrix/")
-async def get_embedding_matrix(file: str = Query(...)):
-    emb_path = os.path.join(EMBED_DIR, file)
-    if not os.path.exists(emb_path):
-        return {"error": "Embedding file not found"}
-    tensor = torch.load(emb_path)
-    matrix = tensor.cpu().numpy().tolist()
-    return {"filename": file, "matrix": matrix}
+    return {"filename": filename, "embedding_file": emb_path, "matrix": matrix}
